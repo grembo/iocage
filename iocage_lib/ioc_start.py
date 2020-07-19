@@ -271,14 +271,12 @@ class IOCStart(object):
             }, _callback=self.callback,
                 silent=self.silent)
 
-        if wants_dhcp:
-            self.__check_dhcp_or_accept_rtadv__(dhcp=True)
+        self.__check_dhcp_or_accept_rtadv__(ipv4=True, enable=wants_dhcp)
 
         if rtsold:
             self.__check_rtsold__()
 
-        if 'accept_rtadv' in self.ip6_addr:
-            self.__check_dhcp_or_accept_rtadv__(dhcp=False)
+        self.__check_dhcp_or_accept_rtadv__(ipv4=False, enable='accept_rtadv' in self.ip6_addr)
 
         if mount_procfs:
             su.Popen(
@@ -491,28 +489,20 @@ class IOCStart(object):
         devfs_paths = None
         devfs_includes = None
 
-        if self.conf['type'] == 'pluginv2' and os.path.isfile(
-            os.path.join(self.path, f'{self.conf["plugin_name"]}.json')
-        ):
-            with open(
-                os.path.join(self.path, f'{self.conf["plugin_name"]}.json'),
-                'r'
-            ) as f:
+        manifest_path = os.path.join(self.path, f'{self.conf["plugin_name"]}.json')
+        if self.conf['type'] == 'pluginv2' and os.path.isfile(manifest_path):
+            with open(manifest_path, 'r') as f:
                 devfs_json = json.load(f)
-                if "devfs_ruleset" in devfs_json:
-                    plugin_name = self.conf['plugin_name']
-                    plugin_devfs = devfs_json[
-                        "devfs_ruleset"][f"plugin_{plugin_name}"]
-                    devfs_paths = plugin_devfs['paths']
-                    devfs_includes = None if 'includes' not in \
-                        plugin_devfs else plugin_devfs['includes']
+            iocage_lib.ioc_common.validate_plugin_manifest(devfs_json, self.callback, self.silent)
+            devfs_paths = devfs_json.get('devfs_ruleset', {}).get('paths')
+            devfs_includes = devfs_json.get('devfs_ruleset', {}).get('includes')
 
         # Generate dynamic devfs ruleset from configured one
         (manual_devfs_config, configured_devfs_ruleset, devfs_ruleset) \
             = iocage_lib.ioc_common.generate_devfs_ruleset(
                 self.conf, devfs_paths, devfs_includes)
 
-        if int(devfs_ruleset) <= 0:
+        if int(devfs_ruleset) < 0:
             iocage_lib.ioc_common.logit({
                 "level": "ERROR",
                 "message": f"{self.uuid} devfs_ruleset"
@@ -583,7 +573,6 @@ class IOCStart(object):
                 f'devfs_ruleset={devfs_ruleset}',
                 f'enforce_statfs={enforce_statfs}',
                 f'children.max={children_max}',
-                f'exec.prestart={exec_prestart}',
                 f'exec.clean={exec_clean}',
                 f'exec.timeout={exec_timeout}',
                 f'stop.timeout={stop_timeout}',
@@ -614,6 +603,60 @@ class IOCStart(object):
             "IOCAGE_HOSTNAME": f"{host_hostname}",
             "IOCAGE_NAME": f"ioc-{self.uuid}",
         }
+
+        if nat:
+            # We pass some environment variables to the shell script
+            # for nat based jails currently aiding in doing jail specific
+            # tasks in the host environment
+            pre_start_env = {
+                **os.environ,
+                'INTERNAL_DEFAULT_ROUTER': self.defaultrouter,
+                'INTERNAL_IP': self.ip4_addr.split(
+                    ','
+                )[0].split('|')[-1].split('/')[0]
+            }
+            default_gw_iface = self.host_gateways['ipv4']['interface']
+            if default_gw_iface:
+                gw_addresses = netifaces.ifaddresses(
+                    default_gw_iface
+                )[netifaces.AF_INET]
+                if gw_addresses:
+                    pre_start_env.update({
+                        'EXT_HOST': gw_addresses[0]['addr'],
+                        'EXT_BCAST': gw_addresses[0]['broadcast'],
+                    })
+
+            if vnet:
+                pre_start_env[
+                    'INTERNAL_BROADCAST_IP'
+                ] = ipaddress.IPv4Network(
+                    f'{pre_start_env["INTERNAL_IP"]}/30', False
+                ).broadcast_address.exploded
+            else:
+                pre_start_env['INTERNAL_BROADCAST_IP'] = pre_start_env[
+                    'INTERNAL_IP'
+                ]
+        else:
+            pre_start_env = None
+
+        prestart_success, prestart_error = iocage_lib.ioc_common.runscript(
+            exec_prestart, pre_start_env
+        )
+
+        if prestart_error:
+            iocage_lib.ioc_stop.IOCStop(
+                self.uuid, self.path, force=True, silent=True
+            )
+
+            iocage_lib.ioc_common.logit({
+                'level': 'EXCEPTION',
+                'message': '  + Executing exec_prestart FAILED\n'
+                           f'ERROR:\n{prestart_error}\n\nRefusing to '
+                           f'start {self.uuid}: exec_prestart failed'
+            },
+                _callback=self.callback,
+                silent=self.silent
+            )
 
         start = su.Popen(
             start_cmd, stderr=su.PIPE,
@@ -922,7 +965,7 @@ class IOCStart(object):
             # Let's set the specified rules
             iocage_lib.ioc_common.logit({
                 'level': 'INFO',
-                'message': f'  + Setting RCTL props'
+                'message': '  + Setting RCTL props'
             })
 
             failed = rctl_jail.set_rctl_rules(
@@ -1109,10 +1152,12 @@ class IOCStart(object):
             nic, bridge = nic_def.split(":")
 
             try:
-                if not nat_addr:
+                if self.get(f"{nic}_mtu") != 'auto':
+                    membermtu = self.get(f"{nic}_mtu")
+                elif not nat_addr:
                     membermtu = self.find_bridge_mtu(bridge)
                 else:
-                    membermtu = '1500'
+                    membermtu = self.get('vnet_default_mtu')
 
                 dhcp = self.get('dhcp')
 
@@ -1377,38 +1422,50 @@ class IOCStart(object):
 
         return mac_a, mac_b
 
-    def __check_dhcp_or_accept_rtadv__(self, dhcp):
+    def __check_dhcp_or_accept_rtadv__(self, ipv4, enable):
         # legacy behavior to enable it on every NIC
-        if dhcp and self.conf['dhcp']:
+        if ipv4 and (self.conf['dhcp'] or not enable):
             nic_list = self.get('interfaces').split(',')
             nics = list(map(lambda x: x.split(':')[0], nic_list))
         else:
             nics = []
-            check_var = 'DHCP' if dhcp else 'ACCEPT_RTADV'
-            for ip in (self.ip4_addr if dhcp else self.ip6_addr).split(','):
+            check_var = 'DHCP' if ipv4 else 'ACCEPT_RTADV'
+            for ip in filter(
+                lambda i: check_var in i.upper() and '|' in i,
+                (self.ip4_addr if ipv4 else self.ip6_addr).split(',')
+            ):
                 nic, addr = ip.rsplit('/', 1)[0].split('|')
 
                 if addr.upper() == check_var:
                     nics.append(nic)
 
+        rc_conf_path = os.path.join(self.path, 'root/etc/rc.conf')
+        if not os.path.exists(rc_conf_path):
+            open(rc_conf_path, 'w').close()
+            entries = {}
+        else:
+            with open(rc_conf_path, 'r') as f:
+                entries = {
+                    k: v.replace("'", '').replace('"', '')
+                    for k, v in map(
+                        lambda l: [e.strip() for e in l.strip().split('=')],
+                        filter(lambda l: l.strip() and not l.startswith('#'), f.readlines())
+                    )
+                }
         for nic in nics:
             if 'vnet' in nic:
                 # Inside jails they are epairNb
                 nic = f"{nic.replace('vnet', 'epair')}b"
 
-            if dhcp:
-                cmd = f'ifconfig_{nic}=SYNCDHCP'
+            key = f'ifconfig_{nic}' if ipv4 else f'ifconfig_{nic}_ipv6'
+            value = 'SYNCDHCP' if ipv4 else 'inet6 auto_linklocal accept_rtadv autoconf'
+            if enable:
+                cmd = [f'{key}={value}']
             else:
-                cmd = f'ifconfig_{nic}_ipv6' \
-                      '=inet6 auto_linklocal accept_rtadv autoconf'
+                cmd = ['-x', key] if key in entries and entries[key] == value else []
 
-            su.run(
-                [
-                    'sysrc', '-f', f'{self.path}/root/etc/rc.conf',
-                    cmd
-                ],
-                stdout=su.PIPE
-            )
+            if cmd:
+                su.run(['sysrc', '-f', rc_conf_path] + cmd, stdout=su.PIPE)
 
     def __check_rtsold__(self):
         if 'accept_rtadv' not in self.ip6_addr:
@@ -1500,7 +1557,7 @@ class IOCStart(object):
 
         memberif = self.get_bridge_members(bridge)
         if not memberif:
-            return '1500'
+            return self.get('vnet_default_mtu')
 
         membermtu = iocage_lib.ioc_common.checkoutput(
             ["ifconfig", memberif[0]]

@@ -36,6 +36,9 @@ import re
 import shutil
 import subprocess as su
 import requests
+import tarfile
+import tempfile
+import threading
 import urllib.parse
 import uuid
 
@@ -43,12 +46,19 @@ import iocage_lib.ioc_common
 import iocage_lib.ioc_create
 import iocage_lib.ioc_destroy
 import iocage_lib.ioc_exec
+import iocage_lib.ioc_list
 import iocage_lib.ioc_json
+import iocage_lib.ioc_start
+import iocage_lib.ioc_stop
 import iocage_lib.ioc_upgrade
 import iocage_lib.ioc_exceptions
 import texttable
 
 from iocage_lib.dataset import Dataset
+
+
+GIT_LOCK = threading.Lock()
+RE_PLUGIN_VERSION = re.compile(r'"path":"([/\.\+,\d\w-]*)\.txz"')
 
 
 class IOCPlugin(object):
@@ -117,10 +127,7 @@ class IOCPlugin(object):
             )
 
         if self.branch is None and not self.hardened:
-            freebsd_version = su.run(['freebsd-version'],
-                                     stdout=su.PIPE,
-                                     stderr=su.STDOUT)
-            r = freebsd_version.stdout.decode().rstrip().split('-', 1)[0]
+            r = self.retrieve_freebsd_version()
 
             self.branch = f'{r}-RELEASE' if '.' in r else f'{r}.0-RELEASE'
         elif self.branch is None and self.hardened:
@@ -134,16 +141,42 @@ class IOCPlugin(object):
         )
 
     @staticmethod
+    def retrieve_freebsd_version():
+        return su.run(
+            ['freebsd-version'], stdout=su.PIPE, stderr=su.STDOUT
+        ).stdout.decode().rstrip().split('-', 1)[0]
+
+    @staticmethod
     def fetch_plugin_packagesites(package_sites):
         def download_parse_packagesite(packagesite_url):
             package_site_data = {}
-            try:
-                response = requests.get(f'{packagesite_url}/All/', timeout=20)
-                response.raise_for_status()
 
-                for pkg in re.findall(r'<a.*>\s*(\S+).txz</a>', response.text):
-                    package_site_data[pkg.rsplit('-', 1)[0]] = \
-                        iocage_lib.ioc_common.parse_package_name(pkg)
+            try:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    packagesite_txz_path = os.path.join(tmpdir, 'packagesite.txz')
+                    with requests.get(
+                        f'{packagesite_url}/packagesite.txz', stream=True, timeout=300
+                    ) as r:
+                        r.raise_for_status()
+                        with open(packagesite_txz_path, 'wb') as f:
+                            shutil.copyfileobj(r.raw, f)
+
+                    with tarfile.open(packagesite_txz_path) as p_file:
+                        p_file.extractall(path=tmpdir)
+
+                    packagesite_path = os.path.join(tmpdir, 'packagesite.yaml')
+                    if not os.path.exists(packagesite_path):
+                        raise FileNotFoundError(f'{packagesite_path} not found')
+
+                    with open(packagesite_path, 'r') as f:
+                        for line in f.read().split('\n'):
+                            searched = RE_PLUGIN_VERSION.findall(line)
+                            if not searched:
+                                continue
+                            name = searched[0].rsplit('/', 1)[-1]
+                            package_site_data[
+                                name.rsplit('-', 1)[0]
+                            ] = iocage_lib.ioc_common.parse_package_name(name)
             except Exception:
                 pass
 
@@ -191,24 +224,46 @@ class IOCPlugin(object):
         return version_dict
 
     @staticmethod
-    def retrieve_plugin_index_data(plugin_index_path):
-        with open(
-            os.path.join(plugin_index_path, 'INDEX'), 'r'
-        ) as f:
+    def retrieve_plugin_index_data(plugin_index_path, expand_abi=True):
+        plugin_index = {}
+        index_path = os.path.join(plugin_index_path, 'INDEX')
+        if not os.path.exists(index_path):
+            return plugin_index
+
+        with open(index_path, 'r') as f:
             index = json.loads(f.read())
 
-        plugin_index = {}
         for plugin in index:
+            plugin_manifest_path = os.path.join(
+                plugin_index_path, index[plugin]['MANIFEST']
+            )
+            if not os.path.exists(plugin_manifest_path):
+                continue
+
+            with open(plugin_manifest_path, 'r') as f:
+                plugin_manifest_data = json.loads(f.read())
+
+            if not any(plugin_manifest_data.get(k) for k in ('release', 'packagesite')):
+                continue
+
+            if expand_abi and '${ABI}' in plugin_manifest_data['packagesite']:
+                plugin_manifest_data['packagesite'] = IOCPlugin.expand_abi_with_specified_release(
+                    plugin_manifest_data['packagesite'], plugin_manifest_data['release']
+                )
+
             plugin_index[plugin] = {
                 'primary_pkg': index[plugin].get('primary_pkg'),
                 'category': index[plugin].get('category'),
+                **plugin_manifest_data
             }
-            with open(
-                os.path.join(plugin_index_path, index[plugin]['MANIFEST']), 'r'
-            ) as f:
-                plugin_index[plugin].update(json.loads(f.read()))
 
         return plugin_index
+
+    @staticmethod
+    def expand_abi_with_specified_release(packagesite, release):
+        return packagesite.replace(
+            '${ABI}', f'FreeBSD:{release.split("-")[0].split(".")[0]}:amd64'
+        )
 
     def fetch_plugin_versions(self):
         self.pull_clone_git_repo()
@@ -253,6 +308,7 @@ class IOCPlugin(object):
         """Helper to fetch plugins"""
         plugins = self.fetch_plugin_index(props, index_only=True)
         conf = self.retrieve_plugin_json()
+        iocage_lib.ioc_common.validate_plugin_manifest(conf, self.callback, self.silent)
 
         if self.hardened:
             conf['release'] = conf['release'].replace("-RELEASE", "-STABLE")
@@ -264,30 +320,18 @@ class IOCPlugin(object):
         location = f"{self.iocroot}/jails/{self.jail}"
 
         try:
-            devfs = conf.get("devfs_ruleset", None)
-
-            if devfs is not None:
-                plugin_devfs = devfs[f'plugin_{self.jail}']
-                plugin_devfs_paths = plugin_devfs['paths']
-
-                for prop in props:
-                    key, _, value = prop.partition("=")
-
-                    if key == 'dhcp' and iocage_lib.ioc_common.check_truthy(
-                        value
-                    ):
-                        if 'bpf*' not in plugin_devfs_paths:
-                            plugin_devfs_paths["bpf*"] = None
-
-                plugin_devfs_includes = None if 'includes' not in plugin_devfs\
-                    else plugin_devfs['includes']
-
-                iocage_lib.ioc_common.generate_devfs_ruleset(
-                    self.conf,
-                    paths=plugin_devfs_paths,
-                    includes=plugin_devfs_includes
-                )
             jaildir, _conf, repo_dir = self.__fetch_plugin_create__(props)
+            # As soon as we create the jail, we should write the plugin manifest to jail directory
+            # This is done to ensure that subsequent starts of the jail make use of the plugin
+            # manifest as required
+            status, jid = iocage_lib.ioc_list.IOCList().list_get_jid(self.jail)
+            if status:
+                iocage_lib.ioc_stop.IOCStop(
+                    self.jail, jaildir, silent=True, force=True, callback=self.callback
+                )
+            with open(os.path.join(jaildir, f'{self.plugin}.json'), 'w') as f:
+                f.write(json.dumps(conf, indent=4, sort_keys=True))
+
             self.__fetch_plugin_install_packages__(
                 jaildir, conf, pkg, props, repo_dir
             )
@@ -709,11 +753,13 @@ fingerprint: {fingerprint}
         if ip6 != 'none':
             ip = ','.join([
                 v.split('|')[-1].split('/')[0] for v in ip6.split(',')
+                if 'accept_rtadv' not in v.lower()
             ])
 
-        if not ip and ip4 != 'none' and 'DHCP' not in ip4.upper():
+        if not ip and ip4 != 'none':
             ip = ','.join([
                 v.split('|')[-1].split('/')[0] for v in ip4.split(',')
+                if 'dhcp' not in v.lower()
             ])
 
         if not ip:
@@ -763,11 +809,6 @@ fingerprint: {fingerprint}
 
             self.__update_pull_plugin_artifact__(conf)
 
-            with open(
-                f"{jaildir}/{self.plugin}.json", "w"
-            ) as f:
-                f.write(json.dumps(conf, indent=4, sort_keys=True))
-
             try:
                 shutil.copy(f"{jaildir}/plugin/post_install.sh",
                             f"{jaildir}/root/root")
@@ -809,11 +850,8 @@ fingerprint: {fingerprint}
 
                         if admin_portal:
                             admin_portal = ','.join(
-                                map(
-                                    lambda v: admin_portal.replace(
-                                        '%%IP%%', v
-                                    ),
-                                    ip.split(',')
+                                iocage_lib.ioc_common.retrieve_admin_portals(
+                                    _conf, True, admin_portal
                                 )
                             )
 
@@ -860,8 +898,22 @@ fingerprint: {fingerprint}
     ):
         self.pull_clone_git_repo()
 
-        with open(os.path.join(self.git_destination, 'INDEX'), 'r') as plugins:
-            plugins = json.load(plugins)
+        index_path = os.path.join(self.git_destination, 'INDEX')
+        if not os.path.exists(index_path):
+            # Gracefully handle index not existing bit
+            iocage_lib.ioc_common.logit(
+                {
+                    'level': 'EXCEPTION',
+                    'message': 'Unable to retrieve INDEX of '
+                               f'{self.git_destination} at '
+                               f'{index_path}.'
+                },
+                _callback=self.callback,
+                silent=self.silent
+            )
+        else:
+            with open(index_path, 'r') as plugins:
+                plugins = json.load(plugins)
 
         if index_only:
             return plugins
@@ -990,7 +1042,7 @@ fingerprint: {fingerprint}
     def __run_hook_script__(self, script_path):
         # If the hook script has a service command, we want it to
         # succeed. This is essentially a soft jail restart.
-        self.__stop_rc__()
+        self.stop_rc()
         path = f"{self.iocroot}/jails/{self.jail}"
 
         jail_path = os.path.join(self.iocroot, 'jails', self.jail)
@@ -1025,8 +1077,8 @@ fingerprint: {fingerprint}
                 silent=self.silent
             )
         else:
-            self.__stop_rc__()
-            self.__start_rc__()
+            self.stop_rc()
+            self.start_rc()
 
     def update(self, jid):
         iocage_lib.ioc_common.logit(
@@ -1054,7 +1106,7 @@ fingerprint: {fingerprint}
         self.pull_clone_git_repo()
 
         plugin_conf = self._load_plugin_json()
-        self.__check_manifest__(plugin_conf)
+        self.__check_manifest__(plugin_conf, upgrade=False)
 
         if plugin_conf['artifact']:
             iocage_lib.ioc_common.logit(
@@ -1148,14 +1200,26 @@ fingerprint: {fingerprint}
                 f'{path}/plugin', callback=self.callback
             )
 
-        try:
-            distutils.dir_util.copy_tree(
-                f"{path}/plugin/overlay/",
-                f"{path}/root",
-                preserve_symlinks=True)
-        except distutils.errors.DistutilsFileError:
-            # It just doesn't exist
-            pass
+        if os.path.isdir(f"{path}/plugin/overlay/"):
+            try:
+                # Quickfix for distutils cache bug making re-installed
+                # plugins with same name fail to copy the overlay folder
+                distutils.dir_util._path_created = {}
+
+                distutils.dir_util.copy_tree(
+                    f"{path}/plugin/overlay/",
+                    f"{path}/root",
+                    preserve_symlinks=True)
+            except distutils.errors.DistutilsFileError as e:
+                # Copy tree should succeed if the overlay folder exists
+                iocage_lib.ioc_common.logit(
+                    {
+                        'level': 'EXCEPTION',
+                        'message': f'Error during overlay copy: {str(e)}'
+                    },
+                    _callback=self.callback,
+                    silent=self.silent
+                )
 
     def __update_pkg_remove__(self, jid):
         """Remove all pkgs from the plugin"""
@@ -1238,7 +1302,7 @@ fingerprint: {fingerprint}
         self.pull_clone_git_repo()
 
         plugin_conf = self._load_plugin_json()
-        self.__check_manifest__(plugin_conf)
+        self.__check_manifest__(plugin_conf, upgrade=True)
         plugin_release = plugin_conf["release"]
         iocage_lib.ioc_common.check_release_newer(
             plugin_release, self.callback, self.silent, major_only=True)
@@ -1314,10 +1378,11 @@ fingerprint: {fingerprint}
 
     def _plugin_json_file(self):
         plugin_name = self.plugin.rsplit('_', 1)[0]
+        jail_name = self.jail or plugin_name
         try:
             with open(
                 os.path.join(
-                    self.iocroot, 'jails', plugin_name, f'{plugin_name}.json'
+                    self.iocroot, 'jails', jail_name, f'{plugin_name}.json'
                 ), 'r'
             ) as f:
                 manifest = json.loads(f.read())
@@ -1325,7 +1390,7 @@ fingerprint: {fingerprint}
             iocage_lib.ioc_common.logit(
                 {
                     'level': 'EXCEPTION',
-                    'message': f'Failed retrieving {plugin_name} json'
+                    'message': f'Failed retrieving {jail_name} json'
                 },
                 _callback=self.callback
             )
@@ -1411,7 +1476,7 @@ fingerprint: {fingerprint}
             if snap_name in names:
                 snap.destroy(recursive=False, force=False)
 
-    def __stop_rc__(self):
+    def stop_rc(self):
         iocage_lib.ioc_exec.SilentExec(
             command=["/bin/sh", "/etc/rc.shutdown"],
             path=f"{self.iocroot}/jails/{self.jail}",
@@ -1419,7 +1484,7 @@ fingerprint: {fingerprint}
             callback=self.callback
         )
 
-    def __start_rc__(self):
+    def start_rc(self):
         iocage_lib.ioc_exec.SilentExec(
             command=["/bin/sh", "/etc/rc"],
             path=f"{self.iocroot}/jails/{self.jail}",
@@ -1427,7 +1492,7 @@ fingerprint: {fingerprint}
             callback=self.callback
         )
 
-    def __check_manifest__(self, plugin_conf):
+    def __check_manifest__(self, plugin_conf, upgrade):
         """If the Major ABI changed, they cannot update anymore."""
         jail_conf, write = iocage_lib.ioc_json.IOCJson(
             location=f"{self.iocroot}/jails/{self.jail}").json_load()
@@ -1440,7 +1505,7 @@ fingerprint: {fingerprint}
         iocage_lib.ioc_common.check_release_newer(
             manifest_major_minor, self.callback, self.silent)
 
-        if jail_rel < manifest_rel:
+        if not upgrade and jail_rel < manifest_rel:
             self.__remove_snapshot__(name="update")
             iocage_lib.ioc_common.logit(
                 {
@@ -1473,88 +1538,110 @@ fingerprint: {fingerprint}
         """
         This is to replicate the functionality of cloning/pulling a repo
         """
-        branch = ref
-        try:
-            if os.path.exists(destination) and not IOCPlugin._verify_git_repo(
-                repo_url, destination
-            ):
-                raise git.exc.InvalidGitRepositoryError()
+        with GIT_LOCK:
+            branch = ref
+            try:
+                if os.path.exists(
+                    destination
+                ) and not IOCPlugin._verify_git_repo(repo_url, destination):
+                    raise git.exc.InvalidGitRepositoryError()
 
-            # "Pull"
-            repo = git.Repo(destination)
-            origin = repo.remotes.origin
-            ref = 'master' if f'origin/{ref}' not in repo.refs else ref
-            for command in [
-                ['checkout', ref],
-                ['pull']
-            ]:
-                iocage_lib.ioc_exec.SilentExec(
-                    ['git', '-C', destination] + command,
-                    None, unjailed=True, decode=True,
-                    su_env={
-                        k: os.environ.get(k)
-                        for k in ['http_proxy', 'https_proxy'] if
-                        os.environ.get(k)
-                    }
-                )
-        except (
-            iocage_lib.ioc_exceptions.CommandFailed,
-            git.exc.InvalidGitRepositoryError,
-            git.exc.NoSuchPathError
-        ) as e:
+                # "Pull"
+                repo = git.Repo(destination)
+                origin = repo.remotes.origin
+                ref = 'master' if f'origin/{ref}' not in repo.refs else ref
+                for command in [
+                    ['checkout', ref],
+                    ['pull']
+                ]:
+                    iocage_lib.ioc_exec.SilentExec(
+                        ['git', '-C', destination] + command,
+                        None, unjailed=True, decode=True,
+                        su_env={
+                            k: os.environ.get(k)
+                            for k in ['http_proxy', 'https_proxy'] if
+                            os.environ.get(k)
+                        }
+                    )
+            except (
+                iocage_lib.ioc_exceptions.CommandFailed,
+                git.exc.InvalidGitRepositoryError,
+                git.exc.NoSuchPathError
+            ) as e:
 
-            basic_msg = 'Failed to update git repository:'
+                basic_msg = 'Failed to update git repository:'
+                exception_message = ''
 
-            if isinstance(e, git.exc.NoSuchPathError):
-                f_msg = 'Cloning git repository'
-            elif isinstance(e, git.exc.InvalidGitRepositoryError):
-                f_msg = f'{basic_msg} Invalid Git Repository'
-            else:
-                f_msg = f'{basic_msg} ' \
-                    f'{b" ".join(filter(bool, e.message)).decode()}'
+                if isinstance(e, git.exc.NoSuchPathError):
+                    f_msg = 'Cloning git repository'
+                elif isinstance(e, git.exc.InvalidGitRepositoryError):
+                    f_msg = f'{basic_msg} Invalid Git Repository'
+                else:
+                    exception_message = b' '.join(
+                        filter(bool, e.message)
+                    ).decode()
+                    f_msg = f'{basic_msg} ' \
+                        f'{exception_message}'
 
-            iocage_lib.ioc_common.logit(
-                {
-                    'level': 'ERROR',
-                    'message': f_msg
-                }
-            )
-
-            # Clone
-            shutil.rmtree(destination, ignore_errors=True)
-            kwargs = {'env': os.environ.copy(), 'depth': depth}
-            repo = git.Repo.clone_from(
-                repo_url, destination, **{
-                    k: v for k, v in kwargs.items() if v
-                }
-            )
-            origin = repo.remotes.origin
-
-        if not origin.exists():
-            iocage_lib.ioc_common.logit(
-                {
-                    'level': 'EXCEPTION',
-                    'message': f'Origin: {origin.url} does not exist!'
-                },
-                _callback=callback
-            )
-
-        if f'origin/{ref}' not in repo.refs:
-            ref = 'master'
-            msgs = [
-                f'\nBranch {branch} does not exist at {repo_url}!',
-                'Using "master" branch for plugin, this may not work '
-                'with your RELEASE'
-            ]
-
-            for msg in msgs:
                 iocage_lib.ioc_common.logit(
                     {
-                        'level': 'INFO',
-                        'message': msg
+                        'level': 'ERROR',
+                        'message': f_msg
+                    }
+                )
+
+                if exception_message.strip().startswith(
+                    'fatal: unable to access'
+                ):
+                    # It is possible the user had a bad network and we
+                    # would be in this case destroying the plugin repository
+                    # which would function okay to at least get the
+                    # required data points while listing plugins
+                    iocage_lib.ioc_common.logit(
+                        {
+                            'level': 'ERROR',
+                            'message': f'Not cloning {repo_url}'
+                                       'as git-pull failed due to '
+                                       'network issues.'
+                        }
+                    )
+                    return
+
+                # Clone
+                shutil.rmtree(destination, ignore_errors=True)
+                kwargs = {'env': os.environ.copy(), 'depth': depth}
+                repo = git.Repo.clone_from(
+                    repo_url, destination, **{
+                        k: v for k, v in kwargs.items() if v
+                    }
+                )
+                origin = repo.remotes.origin
+
+            if not origin.exists():
+                iocage_lib.ioc_common.logit(
+                    {
+                        'level': 'EXCEPTION',
+                        'message': f'Origin: {origin.url} does not exist!'
                     },
                     _callback=callback
                 )
 
-        # Time to make this reality
-        repo.git.checkout(ref)
+            if f'origin/{ref}' not in repo.refs:
+                ref = 'master'
+                msgs = [
+                    f'\nBranch {branch} does not exist at {repo_url}!',
+                    'Using "master" branch for plugin, this may not work '
+                    'with your RELEASE'
+                ]
+
+                for msg in msgs:
+                    iocage_lib.ioc_common.logit(
+                        {
+                            'level': 'INFO',
+                            'message': msg
+                        },
+                        _callback=callback
+                    )
+
+            # Time to make this reality
+            repo.git.checkout(ref)

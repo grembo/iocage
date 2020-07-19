@@ -356,9 +356,38 @@ class IOCage:
 
         for pool in PoolListableResource():
             if pool == zpool:
-                pool.activate_pool()
+                locked_error = None
+                if pool.root_dataset.locked:
+                    locked_error = f'ZFS pool "{zpool}" root dataset is locked'
+
+                iocage_ds = Dataset(os.path.join(zpool.name, 'iocage'))
+                if iocage_ds.exists and iocage_ds.locked:
+                    locked_error = f'ZFS dataset "{iocage_ds.name}" is locked'
+                if locked_error:
+                    ioc_common.logit(
+                        {
+                            'level': 'EXCEPTION',
+                            'message': locked_error,
+                        },
+                        _callback=self.callback,
+                        silent=self.silent,
+                    )
+                else:
+                    pool.activate_pool()
             else:
                 pool.deactivate_pool()
+
+    def deactivate(self, zpool):
+        zpool = Pool(zpool, cache=False)
+        if not zpool.exists:
+            ioc_common.logit(
+                {
+                    'level': 'EXCEPTION',
+                    'message': f'ZFS pool "{zpool}" not found!'
+                },
+                _callback=self.callback,
+                silent=self.silent)
+        zpool.deactivate_pool()
 
     def chroot(self, command):
         """Deprecated: Chroots into a jail and runs a command, or the shell."""
@@ -507,7 +536,7 @@ class IOCage:
 
             arch = os.uname()[4]
 
-            if arch == 'arm64':
+            if arch in {'i386', 'arm64'}:
                 files = ['MANIFEST', 'base.txz', 'src.txz']
             else:
                 files = ['MANIFEST', 'base.txz', 'lib32.txz', 'src.txz']
@@ -969,7 +998,7 @@ class IOCage:
 
         if not _list:
             if not kwargs.get('files', None):
-                if arch == 'arm64':
+                if arch in {'i386', 'arm64'}:
                     kwargs['files'] = ['MANIFEST', 'base.txz', 'src.txz']
                 else:
                     kwargs['files'] = ['MANIFEST', 'base.txz', 'lib32.txz',
@@ -1937,10 +1966,17 @@ class IOCage:
 
             is_basejail = ioc_common.check_truthy(conf['basejail'])
             params = [] if is_basejail else [True, uuid]
-            ioc_fetch.IOCFetch(
-                release,
-                callback=self.callback
-            ).fetch_update(*params)
+            try:
+                ioc_fetch.IOCFetch(
+                    release,
+                    callback=self.callback
+                ).fetch_update(*params)
+            finally:
+                if not started and jail_type == 'pluginv2':
+                    silent = self.silent
+                    self.silent = True
+                    self.restart()
+                    self.silent = silent
 
             ioc_common.logit({
                 'level': 'INFO',

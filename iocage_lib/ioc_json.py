@@ -31,6 +31,7 @@ import logging
 import os
 import re
 import shutil
+import string
 import subprocess as su
 import sys
 
@@ -433,7 +434,7 @@ class IOCConfiguration:
     @staticmethod
     def get_version():
         """Sets the iocage configuration version."""
-        version = '27'
+        version = '28'
 
         return version
 
@@ -448,7 +449,7 @@ class IOCConfiguration:
             # iocage skip is false
             old = False
             matches = []
-            zpools = list(PoolListableResource())
+            zpools = [pool for pool in PoolListableResource() if not pool.root_dataset.locked]
             for pool in zpools:
                 if pool.active:
                     matches.append(pool)
@@ -579,13 +580,43 @@ class IOCConfiguration:
             # Use the hosts prefix to start generation from.
             # Helps avoid clashes with other systems in the network
             mac_prefix = default_mac[0]['addr'].replace(':', '')[:6]
+            if len(mac_prefix) != 6 or not set(mac_prefix).issubset(string.hexdigits):
+                # We do this because in certain cases ( very likely due to netifaces not properly
+                # retrieving values ) mac_prefix can be `lo0` which results in an error
+                # as we consider this to be a valid mac prefix below and just try to replace bits
+                # which in this case don't exist resulting in an unintended exception
+                raise ValueError()
 
-            return mac_prefix
-        except KeyError:
+        except (KeyError, ValueError):
             # They don't have a default gateway, opting for generation of mac
             mac = random.randint(0x00, 0xfffff)
 
-            return f'{mac:06x}'
+            mac_prefix = f'{mac:06x}'
+
+        # Reason for this change is that the first bit in the first byte of
+        # mac address dictates unicast/multicast address. In case of
+        # multicast address, bridge does not learn from such addresses.
+        # So we make sure that we have it unset and the second bit indicates
+        # that this mac is being used in a local network which we set it
+        # always.
+        if not IOCConfiguration.validate_mac_prefix(mac_prefix):
+            # First and second bits in the first byte will be at
+            # 7th and 6th indexes respectively as networks are
+            # MSB-LTR ordered
+            binary = list(format(int(mac_prefix, 16), '024b'))
+            binary[6] = '1'
+            binary[7] = '0'
+            mac_prefix = format(int(''.join(binary), 2), '06x')
+
+        return mac_prefix
+
+    @staticmethod
+    def validate_mac_prefix(mac_prefix):
+        valid = len(mac_prefix) == 6
+        if valid:
+            binary = format(int(mac_prefix, 16), '024b')
+            valid = binary[7] == '0' and binary[6] == '1'
+        return valid
 
     def json_write(self, data, _file="/config.json", defaults=False):
         """Write a JSON file at the location given with supplied data."""
@@ -683,19 +714,18 @@ class IOCConfiguration:
                         pass
                     else:
                         if plugin_data.get('name'):
-                            conf['plugin_name'] = plugin_data['name'].lower()
-                            # If this happens, we want to rename the
-                            # json file so it can be detected by iocage
-                            if plugin_data['name'] != json_files[0].rstrip(
-                                '.json'
-                            ):
-                                shutil.move(
-                                    os.path.join(jail_path, json_files[0]),
-                                    os.path.join(
-                                        jail_path,
-                                        f'{plugin_data["name"].lower()}.json'
-                                    )
-                                )
+                            # If the json file has a name entry, we assume
+                            # that the json file in question is the plugin
+                            # manifest and we use the json file's name
+                            # as the plugin name. Motivation is that most
+                            # if not all have same plugin entries as their
+                            # manifest names, however some plugins like plex
+                            # have a different plugin name in their manifest,
+                            # a short one which causes issues if the user
+                            # tries to upgrade.
+                            conf['plugin_name'] = json_files[0].rsplit(
+                                '.json', 1
+                            )[0]
 
             # This is our last resort - if above strategy didn't work,
             # let's use host_hostuuid in this case
@@ -708,6 +738,9 @@ class IOCConfiguration:
                 'channels-dvr', 'dnsmasq', 'homebridge', 'irssi', 'madsonic',
                 'openvpn', 'quasselcore', 'rtorrent-flood', 'sickchill',
                 'unificontroller', 'unificontroller-lts', 'weechat', 'xmrig',
+                'radarr', 'sonarr', 'backuppc', 'clamav', 'couchpotato', 'emby',
+                'jenkins', 'jenkins-lts', 'mineos', 'transmission', 'tautulli',
+                'qbittorrent', 'zoneminder',
             ) and conf['plugin_repository'] in official_repo:
                 conf['plugin_repository'] = \
                     'https://github.com/ix-plugin-hub/iocage-plugin-index.git'
@@ -867,6 +900,13 @@ class IOCConfiguration:
         # Version 27 key
         if not conf.get('min_dyn_devfs_ruleset'):
             conf['min_dyn_devfs_ruleset'] = '1000'
+
+        # Version 28 keys
+        for x in range(0, 4):
+            if not conf.get(f"vnet{x}_mtu"):
+                conf[f"vnet{x}_mtu"] = 'auto'
+        if not conf.get("vnet_default_mtu"):
+            conf["vnet_default_mtu"] = '1500'
 
         if not default:
             conf.update(jail_conf)
@@ -1206,6 +1246,11 @@ class IOCConfiguration:
             'plugin_name': 'none',
             'plugin_repository': 'none',
             'min_dyn_devfs_ruleset': '1000',
+            'vnet0_mtu': 'auto',
+            'vnet1_mtu': 'auto',
+            'vnet2_mtu': 'auto',
+            'vnet3_mtu': 'auto',
+            'vnet_default_mtu': '1500',
         }
 
     def check_default_config(self):
@@ -1304,6 +1349,12 @@ class IOCJson(IOCConfiguration):
         'ip_hostname',
         'assign_localhost',
         'nat'
+    ]
+
+    default_only_props = [
+        'nat_prefix',
+        'nat_interface',
+        'nat_backend',
     ]
 
     def __init__(self,
@@ -2116,6 +2167,11 @@ class IOCJson(IOCConfiguration):
             'plugin_name': ('string', ),
             'plugin_repository': ('string', ),
             'min_dyn_devfs_ruleset': ('string', ),
+            "vnet0_mtu": ("string", ),
+            "vnet1_mtu": ("string", ),
+            "vnet2_mtu": ("string", ),
+            "vnet3_mtu": ("string", ),
+            "vnet_default_mtu": ("string", ),
         }
 
         zfs_props = {
@@ -2131,9 +2187,7 @@ class IOCJson(IOCConfiguration):
             "reservation": "none",
         }
 
-        if key in (
-            'nat_prefix', 'nat_interface', 'nat_backend'
-        ):
+        if key in self.default_only_props:
             if not default:
                 iocage_lib.ioc_common.logit(
                     {
@@ -2399,7 +2453,7 @@ class IOCJson(IOCConfiguration):
                 elif key in ('devfs_ruleset', 'min_dyn_devfs_ruleset'):
                     try:
                         intval = int(value)
-                        if intval <= 0:
+                        if intval < 0:
                             raise ValueError()
                         conf[key] = str(intval)
                     except ValueError:
@@ -2412,7 +2466,21 @@ class IOCJson(IOCConfiguration):
                             silent=self.silent,
                             exception=ioc_exceptions.ValidationFailed
                         )
-
+                elif key == 'mac_prefix':
+                    # Invalid letters - 0,1,3,4,5,7,8,9,B,C,D,F
+                    # Valid letters - 2,6,A,E
+                    if not self.validate_mac_prefix(value):
+                        iocage_lib.ioc_common.logit(
+                            {
+                                'level': 'EXCEPTION',
+                                'message': 'Invalid mac_prefix. Must match '
+                                           '`?X????` where ? can be any '
+                                           'valid hex digit (0-9, A-F) and '
+                                           'X is one of 2, 6, A or E.'
+                            },
+                            _callback=self.callback,
+                            silent=self.silent
+                        )
                 return value, conf
             else:
                 err = f"{value} is not a valid value for {key}.\n"
