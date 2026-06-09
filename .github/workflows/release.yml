@@ -1,9 +1,11 @@
+---
+
 name: Releases
 
-on: 
+on:
   push:
     tags:
-    - '*'
+      - '*'
 
 jobs:
 
@@ -12,12 +14,12 @@ jobs:
     permissions:
       contents: write
     steps:
-    - uses: actions/checkout@v4
-    - uses: ksm2/archive-action@v1
-      with:
-      format: "tar.gz"
-      name: "iocage-${GITHUB_REF##*/}.tar.gz"
-    - uses: ncipollo/release-action@v1
-      with:
-        artifacts: "iocage-${GITHUB_REF##*/}.tar.gz"
+      - uses: actions/checkout@v4
+      - uses: ksm2/archive-action@v1
+        with:
+          format: "tar.gz"
+          name: "iocage-${GITHUB_REF##*/}.tar.gz"
+      - uses: ncipollo/release-action@v1
+        with:
+          artifacts: "iocage-${GITHUB_REF##*/}.tar.gz"
 #        bodyFile: "body.md"
