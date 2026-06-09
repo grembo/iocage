@@ -14,12 +14,18 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: ksm2/archive-action@v1
+        env:
+          # node20 is deprecated, force node24 until
+          # the action is updated (there is still a warning)
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
           format: "tar.gz"
           name: "iocage-${{ github.ref_name }}"
       - uses: ncipollo/release-action@v1
         with:
           artifacts: "iocage-${{ github.ref_name }}.tar.gz"
-#        bodyFile: "body.md"
+          generateReleaseNotes: true
+          draft: true
+          # bodyFile: "body.md"
