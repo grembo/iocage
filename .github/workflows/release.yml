@@ -18,8 +18,8 @@ jobs:
       - uses: ksm2/archive-action@v1
         with:
           format: "tar.gz"
-          name: "iocage-${GITHUB_REF##*/}.tar.gz"
+          name: "iocage-${{ github.ref_name }}"
       - uses: ncipollo/release-action@v1
         with:
-          artifacts: "iocage-${GITHUB_REF##*/}.tar.gz"
+          artifacts: "iocage-${{ github.ref_name }}.tar.gz"
 #        bodyFile: "body.md"
