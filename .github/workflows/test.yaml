@@ -31,3 +31,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     - name: Lint with flake8
       run: ./flake8.sh
+    - name: "Check sphinx build"
+      uses: ammaraskar/sphinx-action@master
+      with:
+        docs-folder: "doc/"
