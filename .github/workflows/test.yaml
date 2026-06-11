@@ -34,4 +34,5 @@ jobs:
     - name: "Check sphinx build"
       uses: ammaraskar/sphinx-action@master
       with:
-        docs-folder: "doc/"
+        docs-folder: "doc/source"
+        build-command: "sphinx-build -b html . ../../docs"

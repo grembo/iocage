@@ -15,6 +15,15 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v6
+      - name: "Build documentation"
+        uses: ammaraskar/sphinx-action@master
+        with:
+          docs-folder: "doc/source/"
+          build-command: >
+            sphinx-build
+            -D version=${{ github.ref_name }}
+            -D release=${{ github.ref_name }}
+            -b html . ../../docs
       - uses: ksm2/archive-action@v1
         env:
           # node20 is deprecated, force node24 until
