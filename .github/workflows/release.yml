@@ -1,28 +1,34 @@
 ---
 
-name: Releases
+name: Release (reusable)
 
 on:
-  push:
-    tags:
-      - '*'
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+    secrets:
+      token:
+        required: true
 
 jobs:
-
-  build:
+  build-release:
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.version }}
       - name: "Build documentation"
         uses: ammaraskar/sphinx-action@master
         with:
           docs-folder: "doc/source/"
           build-command: >
             sphinx-build
-            -D version=${{ github.ref_name }}
-            -D release=${{ github.ref_name }}
+            -D version=${{ inputs.version }}
+            -D release=${{ inputs.version }}
             -b html . ../../docs
       - uses: ksm2/archive-action@v1
         env:
@@ -31,10 +37,11 @@ jobs:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
           format: "tar.gz"
-          name: "iocage-${{ github.ref_name }}"
+          name: "iocage-${{ inputs.version }}"
       - uses: ncipollo/release-action@v1
         with:
-          artifacts: "iocage-${{ github.ref_name }}.tar.gz"
+          tag: ${{ inputs.version }}
+          artifacts: "iocage-${{ inputs.version }}.tar.gz"
           generateReleaseNotes: true
           draft: true
           # bodyFile: "body.md"
