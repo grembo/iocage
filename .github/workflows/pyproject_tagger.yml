@@ -10,20 +10,24 @@ jobs:
     name: Tag master using pyproject.toml
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout master
-      uses: actions/checkout@v4
-    - name: Determine tag/version
-      id: computed-tag
-      run: |
-        set -e
-        TAG=$(cat pyproject.toml \
-          | grep --extended-regexp "^version =" \
-          | grep --extended-regexp --only-matching "[0-9]+\.[0-9]+" \
-          | head --lines=1)
-        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-    - name: Tag project based on pyproject
-      id: tag_version
-      uses: mathieudutour/github-tag-action@v6.2
-      with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
-        custom_tag: ${{ steps.computed-tag.outputs.tag }}
+      - name: Checkout master
+        uses: actions/checkout@v4
+      - name: Determine tag/version
+        id: computed-tag
+        run: |
+          set -e
+          TAG=$(cat pyproject.toml \
+            | grep --extended-regexp "^version =" \
+            | grep --extended-regexp --only-matching "[0-9]+\.[0-9]+" \
+            | head --lines=1)
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - name: Tag project based on pyproject
+        id: tag_version
+        uses: mathieudutour/github-tag-action@v6.2
+        env:
+          # node20 is deprecated, force node24 until
+          # the action is updated (there is still a warning)
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          custom_tag: ${{ steps.computed-tag.outputs.tag }}
