@@ -8,9 +8,9 @@ on:
 jobs:
   build:
     name: Tag master using pyproject.toml
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     steps:
-    - name: Checkout main
+    - name: Checkout master
       uses: actions/checkout@v4
     - name: Determine tag/version
       id: computed-tag
