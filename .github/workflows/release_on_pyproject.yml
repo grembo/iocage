@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - master
+      - fixtar
+
 jobs:
   collect:
     name: Tag master using pyproject.toml
