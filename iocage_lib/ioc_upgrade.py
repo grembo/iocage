@@ -27,6 +27,7 @@ import fileinput
 import hashlib
 import os
 import pathlib
+import re
 import subprocess as su
 import tempfile
 import urllib.request
@@ -83,14 +84,16 @@ class IOCUpgrade:
             http_proxy_var = 'http_proxy'
         else:
             http_proxy_var = 'HTTP_PROXY'
-        for envvar in [http_proxy_var, 'HTTPS_PROXY', 'HTTP_PROXY_AUTH', 'NO_PROXY']:
+        for envvar in [http_proxy_var, 'HTTPS_PROXY',
+                       'HTTP_PROXY_AUTH', 'NO_PROXY']:
             if os.environ.get(envvar, '') != '':
                 self.upgrade_env[envvar] = os.environ.get(envvar)
 
         self.callback = callback
 
         # symbolic link created on fetch by freebsd-update
-        bd_hash = hashlib.sha256((self.path + '\n').encode('utf-8')).hexdigest()
+        bd_hash = hashlib.sha256(
+            (self.path + '\n').encode('utf-8')).hexdigest()
         self.freebsd_install_link = os.path.join(
             self.path,
             'var/db/freebsd-update', bd_hash + '-install')
@@ -118,10 +121,13 @@ class IOCUpgrade:
                 fbsd_update = fetched_update
             else:
                 f = "https://cgit.freebsd.org/src/plain" \
-                    f"/usr.sbin/freebsd-update/freebsd-update.sh?h=releng/{f_rel}"
+                    f"/usr.sbin/freebsd-update" \
+                    f"/freebsd-update.sh?h=releng/{f_rel}"
                 tmp = tempfile.NamedTemporaryFile(delete=False)
                 with urllib.request.urlopen(f) as http:
-                    tmp.write(http.read())
+                    tmp.write(re.sub("upgrade_check_kmod_ports\n",
+                                     "#upgrade_check_kmod_ports\n",
+                                     http.read().decode()).encode())
                 tmp.close()
                 os.chmod(tmp.name, 0o755)
                 fbsd_update = tmp.name

@@ -25,6 +25,7 @@
 import hashlib
 import logging
 import os
+import re
 import shutil
 import subprocess as su
 import tarfile
@@ -46,6 +47,7 @@ import iocage_lib.ioc_start
 
 from iocage_lib.pools import Pool
 from iocage_lib.dataset import Dataset
+
 
 # taken from tarfile.tar_filter (and _get_filtered_attrs)
 # basically the same, but **without**:
@@ -70,6 +72,7 @@ def untar_release_filter(member, dest_path):
     if new_attrs:
         return member.replace(**new_attrs, deep=False)
     return member
+
 
 class IOCFetch:
 
@@ -906,7 +909,8 @@ class IOCFetch:
 
         if exception_msg:
             iocage_lib.ioc_common.logit(
-                {'level': 'EXCEPTION', 'message': f'Failed to update: {exception_msg}'}
+                {'level': 'EXCEPTION',
+                 'message': f'Failed to update: {exception_msg}'}
             )
 
         su.Popen(cmd).communicate()
@@ -916,7 +920,9 @@ class IOCFetch:
 
             tmp = tempfile.NamedTemporaryFile(delete=False)
             with urllib.request.urlopen(f) as fbsd_update:
-                tmp.write(fbsd_update.read())
+                tmp.write(re.sub("upgrade_check_kmod_ports\n",
+                                 "#upgrade_check_kmod_ports\n",
+                                 fbsd_update.read().decode()).encode())
             tmp.close()
             os.chmod(tmp.name, 0o755)
             fetch_name = tmp.name
