@@ -917,6 +917,7 @@ class IOCFetch:
 
             tmp = tempfile.NamedTemporaryFile(delete=False)
             with urllib.request.urlopen(f) as fbsd_update:
+                # workaround, see https://github.com/freebsd/iocage/pull/133
                 tmp.write(re.sub("upgrade_check_kmod_ports\n",
                                  "#upgrade_check_kmod_ports\n",
                                  fbsd_update.read().decode()).encode())
