@@ -48,7 +48,6 @@ import iocage_lib.ioc_start
 from iocage_lib.pools import Pool
 from iocage_lib.dataset import Dataset
 
-
 # taken from tarfile.tar_filter (and _get_filtered_attrs)
 # basically the same, but **without**:
 # - Clear high mode bits (setuid, setgid, sticky) and
@@ -72,7 +71,6 @@ def untar_release_filter(member, dest_path):
     if new_attrs:
         return member.replace(**new_attrs, deep=False)
     return member
-
 
 class IOCFetch:
 
@@ -909,8 +907,7 @@ class IOCFetch:
 
         if exception_msg:
             iocage_lib.ioc_common.logit(
-                {'level': 'EXCEPTION',
-                 'message': f'Failed to update: {exception_msg}'}
+                {'level': 'EXCEPTION', 'message': f'Failed to update: {exception_msg}'}
             )
 
         su.Popen(cmd).communicate()
